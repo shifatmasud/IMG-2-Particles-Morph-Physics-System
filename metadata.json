@@ -1,0 +1,5 @@
+{
+  "name": "Image to Fluid Particles",
+  "description": "An interactive web application that transforms any image into a dynamic particle system. The particles react to the user's cursor with a fluid, physics-based push force, creating an engaging visual experience. Built with React, Three.js, and Tailwind CSS.",
+  "requestFramePermissions": []
+}
