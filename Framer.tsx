@@ -9,6 +9,14 @@ interface Vec3 {
     z: number
 }
 
+interface LightingProps {
+    ambientLightColor: string
+    ambientLightIntensity: number
+    pointLightColor: string
+    pointLightIntensity: number
+    pointLightPosition: Vec3
+}
+
 interface ForceProps {
     returnStrength: number
     damping: number
@@ -16,6 +24,11 @@ interface ForceProps {
     pushStrength: number
     particleSize: number
     particleDensity: number
+}
+
+interface AppearanceProps {
+    vibrancy: number
+    exposure: number
 }
 
 interface ImageParticleEffectProps {
@@ -29,12 +42,15 @@ interface ImageParticleEffectProps {
     objectPosition: Vec3
     objectRotation: Vec3
     sceneRotation: Vec3
-    enableMouseMove: boolean
-    enableMouseClick: boolean
+    enablePushForce: boolean
+    enableCollisions: boolean
     force: ForceProps
+    lighting: LightingProps
+    appearance: AppearanceProps
 }
 
 interface Particle {
+    id: number
     currentPosition: THREE.Vector3
     sourcePosition: THREE.Vector3
     targetPosition: THREE.Vector3
@@ -42,6 +58,8 @@ interface Particle {
     currentColor: THREE.Color
     sourceColor: THREE.Color
     targetColor: THREE.Color
+    sourceBaseColor: THREE.Color
+    targetBaseColor: THREE.Color
     attractorPosition: THREE.Vector3
     burstPosition: THREE.Vector3
     sphereTargetPosition: THREE.Vector3
@@ -51,6 +69,108 @@ interface Particle {
 const easeInOutCubic = (t: number): number =>
     t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2
 
+const applyVibrancy = (color: THREE.Color, vibrancy: number): THREE.Color => {
+    const hsl = { h: 0, s: 0, l: 0 }
+    color.getHSL(hsl)
+    hsl.s = Math.min(1, hsl.s * vibrancy)
+    color.setHSL(hsl.h, hsl.s, hsl.l)
+    return color
+}
+
+const handleCollisions = (particles: Particle[], particleSize: number) => {
+    if (particles.length < 2 || particleSize <= 0) return
+
+    const collisionDist = particleSize * 2
+    const collisionDistSq = collisionDist * collisionDist
+
+    const gridCellSize = collisionDist
+    const grid: Map<string, Particle[]> = new Map()
+
+    const getCellKey = (p: THREE.Vector3) => {
+        return `${Math.floor(p.x / gridCellSize)}_${Math.floor(
+            p.y / gridCellSize
+        )}_${Math.floor(p.z / gridCellSize)}`
+    }
+
+    for (const p of particles) {
+        const key = getCellKey(p.currentPosition)
+        if (!grid.has(key)) {
+            grid.set(key, [])
+        }
+        grid.get(key)!.push(p)
+    }
+
+    const collisionNormal = new THREE.Vector3()
+    const relativeVelocity = new THREE.Vector3()
+    const correction = new THREE.Vector3()
+    const impulse = new THREE.Vector3()
+
+    for (const p1 of particles) {
+        const p1x = Math.floor(p1.currentPosition.x / gridCellSize)
+        const p1y = Math.floor(p1.currentPosition.y / gridCellSize)
+        const p1z = Math.floor(p1.currentPosition.z / gridCellSize)
+
+        for (let dx = -1; dx <= 1; dx++) {
+            for (let dy = -1; dy <= 1; dy++) {
+                for (let dz = -1; dz <= 1; dz++) {
+                    const key = `${p1x + dx}_${p1y + dy}_${p1z + dz}`
+                    const cell = grid.get(key)
+                    if (cell) {
+                        for (const p2 of cell) {
+                            if (p1.id >= p2.id) continue
+
+                            const distanceSq =
+                                p1.currentPosition.distanceToSquared(
+                                    p2.currentPosition
+                                )
+
+                            if (
+                                distanceSq > 0 &&
+                                distanceSq < collisionDistSq
+                            ) {
+                                const distance = Math.sqrt(distanceSq)
+                                const overlap = (collisionDist - distance) * 0.5
+
+                                collisionNormal
+                                    .subVectors(
+                                        p1.currentPosition,
+                                        p2.currentPosition
+                                    )
+                                    .multiplyScalar(1 / distance)
+
+                                correction
+                                    .copy(collisionNormal)
+                                    .multiplyScalar(overlap)
+                                p1.currentPosition.add(correction)
+                                p2.currentPosition.sub(correction)
+
+                                relativeVelocity.subVectors(
+                                    p1.velocity,
+                                    p2.velocity
+                                )
+                                const velocityAlongNormal =
+                                    relativeVelocity.dot(collisionNormal)
+
+                                if (velocityAlongNormal > 0) continue
+
+                                const restitution = 0.5
+                                const impulseScalar =
+                                    -(1 + restitution) * velocityAlongNormal
+
+                                impulse
+                                    .copy(collisionNormal)
+                                    .multiplyScalar(impulseScalar * 0.5)
+                                p1.velocity.add(impulse)
+                                p2.velocity.sub(impulse)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 const ImageParticleEffect: React.FC<ImageParticleEffectProps> = (props) => {
     const {
         sourceImageUrl,
@@ -58,9 +178,11 @@ const ImageParticleEffect: React.FC<ImageParticleEffectProps> = (props) => {
         morphState,
         morphDirection,
         onMorphComplete,
-        enableMouseMove,
-        enableMouseClick,
+        enablePushForce,
+        enableCollisions,
         force,
+        lighting,
+        appearance,
     } = props
     const mountRef = useRef<HTMLDivElement>(null)
 
@@ -73,6 +195,8 @@ const ImageParticleEffect: React.FC<ImageParticleEffectProps> = (props) => {
     const rendererRef = useRef<THREE.WebGLRenderer | null>(null)
     const sceneRef = useRef<THREE.Scene | null>(null)
     const cameraRef = useRef<THREE.PerspectiveCamera | null>(null)
+    const ambientLightRef = useRef<THREE.AmbientLight | null>(null)
+    const pointLightRef = useRef<THREE.PointLight | null>(null)
     const animationFrameIdRef = useRef<number | null>(null)
     const onMorphCompleteRef = useRef(onMorphComplete)
     const mouseInteractionStateRef = useRef<"none" | "bursting" | "attracting">(
@@ -107,6 +231,20 @@ const ImageParticleEffect: React.FC<ImageParticleEffectProps> = (props) => {
             THREE.MathUtils.degToRad(props.sceneRotation.z)
         ),
         force: { ...props.force },
+        lighting: {
+            ambientLightColor: new THREE.Color(
+                props.lighting.ambientLightColor
+            ),
+            ambientLightIntensity: props.lighting.ambientLightIntensity,
+            pointLightColor: new THREE.Color(props.lighting.pointLightColor),
+            pointLightIntensity: props.lighting.pointLightIntensity,
+            pointLightPosition: new THREE.Vector3(
+                props.lighting.pointLightPosition.x,
+                props.lighting.pointLightPosition.y,
+                props.lighting.pointLightPosition.z
+            ),
+        },
+        appearance: { ...props.appearance },
     })
     const targetPropsRef = useRef(props)
 
@@ -174,6 +312,7 @@ const ImageParticleEffect: React.FC<ImageParticleEffectProps> = (props) => {
                             imageData[index + 1] / 255,
                             imageData[index + 2] / 255
                         )
+
                         color.convertSRGBToLinear()
                         data.push({
                             position: new THREE.Vector3(posX, posY, 0),
@@ -213,19 +352,41 @@ const ImageParticleEffect: React.FC<ImageParticleEffectProps> = (props) => {
         )
         rendererRef.current.setPixelRatio(window.devicePixelRatio)
         rendererRef.current.outputColorSpace = THREE.SRGBColorSpace
+        rendererRef.current.toneMapping = THREE.ACESFilmicToneMapping
         currentMount.appendChild(rendererRef.current.domElement)
+
+        ambientLightRef.current = new THREE.AmbientLight()
+        sceneRef.current.add(ambientLightRef.current)
+        pointLightRef.current = new THREE.PointLight()
+        sceneRef.current.add(pointLightRef.current)
 
         const objectGroup = new THREE.Group()
         sceneRef.current.add(objectGroup)
         objectGroupRef.current = objectGroup
 
         const mouse = new THREE.Vector2(-1000, -1000)
-        const handleMouseMove = (event: MouseEvent) => {
-            const rect = rendererRef.current!.domElement.getBoundingClientRect()
-            mouse.x = ((event.clientX - rect.left) / rect.width) * 2 - 1
-            mouse.y = -((event.clientY - rect.top) / rect.height) * 2 + 1
+
+        const getPointerCoordinates = (event: MouseEvent | TouchEvent) => {
+            if ("touches" in event && event.touches.length > 0) {
+                return {
+                    clientX: event.touches[0].clientX,
+                    clientY: event.touches[0].clientY,
+                }
+            } else if ("clientX" in event) {
+                return { clientX: event.clientX, clientY: event.clientY }
+            }
+            return null
         }
-        const handleMouseDown = () => {
+
+        const handlePointerMove = (event: MouseEvent | TouchEvent) => {
+            const coords = getPointerCoordinates(event)
+            if (!coords || !rendererRef.current) return
+            const rect = rendererRef.current.domElement.getBoundingClientRect()
+            mouse.x = ((coords.clientX - rect.left) / rect.width) * 2 - 1
+            mouse.y = -((coords.clientY - rect.top) / rect.height) * 2 + 1
+        }
+        
+        const handlePointerDown = () => {
             mouseInteractionStateRef.current = "bursting"
             mouseInteractionStartTimeRef.current = performance.now()
             const burstRadius = 150
@@ -247,18 +408,28 @@ const ImageParticleEffect: React.FC<ImageParticleEffectProps> = (props) => {
                 p.sphereTargetPosition.setFromSphericalCoords(r, phi, theta)
             })
         }
-        const handleMouseUp = () => {
+        const handlePointerUp = () => {
             mouseInteractionStateRef.current = "none"
         }
 
-        if (enableMouseMove)
-            window.addEventListener("mousemove", handleMouseMove)
-        if (enableMouseClick) {
-            window.addEventListener("mousedown", handleMouseDown)
-            window.addEventListener("mouseup", handleMouseUp)
+        if (enablePushForce) {
+            window.addEventListener("mousemove", handlePointerMove)
+            window.addEventListener("touchmove", handlePointerMove, {
+                passive: true,
+            })
         }
+        
+        // Click interaction is always on
+        window.addEventListener("mousedown", handlePointerDown)
+        window.addEventListener("touchstart", handlePointerDown, {
+            passive: true,
+        })
+        window.addEventListener("mouseup", handlePointerUp)
+        window.addEventListener("touchend", handlePointerUp)
 
         const mouse3D = new THREE.Vector3()
+        const forceVector = new THREE.Vector3()
+        const returnForce = new THREE.Vector3()
         const dummy = new THREE.Object3D()
         const animate = () => {
             animationFrameIdRef.current = requestAnimationFrame(animate)
@@ -340,6 +511,66 @@ const ImageParticleEffect: React.FC<ImageParticleEffectProps> = (props) => {
                 lerpFactor
             )
 
+            animated.lighting.ambientLightColor.lerp(
+                new THREE.Color(target.lighting.ambientLightColor),
+                lerpFactor
+            )
+            animated.lighting.ambientLightIntensity = THREE.MathUtils.lerp(
+                animated.lighting.ambientLightIntensity,
+                target.lighting.ambientLightIntensity,
+                lerpFactor
+            )
+            animated.lighting.pointLightColor.lerp(
+                new THREE.Color(target.lighting.pointLightColor),
+                lerpFactor
+            )
+            animated.lighting.pointLightIntensity = THREE.MathUtils.lerp(
+                animated.lighting.pointLightIntensity,
+                target.lighting.pointLightIntensity,
+                lerpFactor
+            )
+            animated.lighting.pointLightPosition.lerp(
+                new THREE.Vector3(
+                    target.lighting.pointLightPosition.x,
+                    target.lighting.pointLightPosition.y,
+                    target.lighting.pointLightPosition.z
+                ),
+                lerpFactor
+            )
+
+            const oldVibrancy = animated.appearance.vibrancy
+            animated.appearance.vibrancy = THREE.MathUtils.lerp(
+                animated.appearance.vibrancy,
+                target.appearance.vibrancy,
+                lerpFactor
+            )
+            const vibrancyChanged =
+                Math.abs(animated.appearance.vibrancy - oldVibrancy) > 0.001
+
+            animated.appearance.exposure = THREE.MathUtils.lerp(
+                animated.appearance.exposure,
+                target.appearance.exposure,
+                lerpFactor
+            )
+            rendererRef.current.toneMappingExposure =
+                animated.appearance.exposure
+
+            if (ambientLightRef.current && pointLightRef.current) {
+                ambientLightRef.current.color.copy(
+                    animated.lighting.ambientLightColor
+                )
+                ambientLightRef.current.intensity =
+                    animated.lighting.ambientLightIntensity
+                pointLightRef.current.color.copy(
+                    animated.lighting.pointLightColor
+                )
+                pointLightRef.current.intensity =
+                    animated.lighting.pointLightIntensity
+                pointLightRef.current.position.copy(
+                    animated.lighting.pointLightPosition
+                )
+            }
+
             animated.force.returnStrength = THREE.MathUtils.lerp(
                 animated.force.returnStrength,
                 target.force.returnStrength,
@@ -385,10 +616,31 @@ const ImageParticleEffect: React.FC<ImageParticleEffectProps> = (props) => {
 
             let needsColorUpdate = false
 
+            if (vibrancyChanged) {
+                needsColorUpdate = true
+                particlesRef.current.forEach((p) => {
+                    applyVibrancy(
+                        p.sourceColor.copy(p.sourceBaseColor),
+                        animated.appearance.vibrancy
+                    )
+                    applyVibrancy(
+                        p.targetColor.copy(p.targetBaseColor),
+                        animated.appearance.vibrancy
+                    )
+                    if (!morphStateRef.current.isMorphing) {
+                        if (morphState === "source") {
+                            p.currentColor.copy(p.sourceColor)
+                        } else {
+                            p.currentColor.copy(p.targetColor)
+                        }
+                    }
+                })
+            }
+            
             const mouseState = mouseInteractionStateRef.current
             const mouseInteractionBurstDuration = 400
 
-            if (mouseState !== "none" && target.enableMouseClick) {
+            if (mouseState !== "none") {
                 const interactionElapsedTime =
                     performance.now() - mouseInteractionStartTimeRef.current
                 particlesRef.current.forEach((p, i) => {
@@ -421,15 +673,17 @@ const ImageParticleEffect: React.FC<ImageParticleEffectProps> = (props) => {
                 return
             }
 
-            const morphState = morphStateRef.current
-            if (morphState.isMorphing) {
-                const elapsedTime = performance.now() - morphState.startTime
+
+            const currentMorphState = morphStateRef.current
+            if (currentMorphState.isMorphing) {
+                const elapsedTime =
+                    performance.now() - currentMorphState.startTime
                 const {
                     duration,
                     phaseOneDuration,
                     phaseTwoDuration,
                     direction,
-                } = morphState
+                } = currentMorphState
                 const phaseTwoEndTime = phaseOneDuration + phaseTwoDuration
 
                 if (elapsedTime >= duration) {
@@ -445,7 +699,7 @@ const ImageParticleEffect: React.FC<ImageParticleEffectProps> = (props) => {
                                 : p.sourceColor
                         )
                     })
-                    morphState.isMorphing = false
+                    currentMorphState.isMorphing = false
                     onMorphCompleteRef.current(direction!)
                     needsColorUpdate = true
                 } else {
@@ -554,33 +808,80 @@ const ImageParticleEffect: React.FC<ImageParticleEffectProps> = (props) => {
                 particleSize,
             } = animated.force
 
-            for (let i = 0; i < particlesRef.current.length; i++) {
-                const p = particlesRef.current[i]
-                if (
-                    target.enableMouseMove &&
-                    mouseInteractionStateRef.current === "none"
-                ) {
-                    const distanceToMouse = p.currentPosition.distanceTo(pos)
-                    if (distanceToMouse < pushRadius) {
-                        const force = new THREE.Vector3()
-                            .subVectors(p.currentPosition, pos)
-                            .normalize()
-                            .multiplyScalar(
-                                (pushRadius - distanceToMouse) / pushRadius
-                            )
-                            .multiplyScalar(pushStrength)
-                        p.velocity.add(force)
+            if (target.enablePushForce && mouseInteractionStateRef.current === "none" && pushRadius > 0) {
+                const pushRadiusSq = pushRadius * pushRadius
+                const gridCellSize = pushRadius
+                const grid: Map<string, Particle[]> = new Map()
+                const getCellKey = (v: THREE.Vector3) =>
+                    `${Math.floor(v.x / gridCellSize)}_${Math.floor(
+                        v.y / gridCellSize
+                    )}_${Math.floor(v.z / gridCellSize)}`
+
+                for (const p of particlesRef.current) {
+                    const key = getCellKey(p.currentPosition)
+                    if (!grid.has(key)) grid.set(key, [])
+                    grid.get(key)!.push(p)
+                }
+
+                const mouseX = Math.floor(pos.x / gridCellSize)
+                const mouseY = Math.floor(pos.y / gridCellSize)
+                const mouseZ = Math.floor(pos.z / gridCellSize)
+
+                for (let dx = -1; dx <= 1; dx++) {
+                    for (let dy = -1; dy <= 1; dy++) {
+                        for (let dz = -1; dz <= 1; dz++) {
+                            const key = `${mouseX + dx}_${mouseY + dy}_${
+                                mouseZ + dz
+                            }`
+                            const cell = grid.get(key)
+                            if (cell) {
+                                for (const p of cell) {
+                                    const distanceSq =
+                                        p.currentPosition.distanceToSquared(pos)
+                                    if (
+                                        distanceSq > 1e-6 &&
+                                        distanceSq < pushRadiusSq
+                                    ) {
+                                        const distance = Math.sqrt(distanceSq)
+                                        const strength =
+                                            (((pushRadius - distance) /
+                                                pushRadius) *
+                                                pushStrength) /
+                                            distance
+                                        forceVector
+                                            .subVectors(p.currentPosition, pos)
+                                            .multiplyScalar(strength)
+                                        p.velocity.add(forceVector)
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
-                const returnForce = new THREE.Vector3()
+            }
+
+            // First loop: apply forces & update positions
+            for (let i = 0; i < particlesRef.current.length; i++) {
+                const p = particlesRef.current[i]
+                returnForce
                     .subVectors(p.attractorPosition, p.currentPosition)
                     .multiplyScalar(returnStrength)
                 p.velocity.add(returnForce)
                 p.velocity.multiplyScalar(damping)
                 p.currentPosition.add(p.velocity)
+            }
 
-                if (needsColorUpdate)
+            // Handle collisions
+            if (target.enableCollisions) {
+                handleCollisions(particlesRef.current, particleSize)
+            }
+
+            // Second loop: update mesh
+            for (let i = 0; i < particlesRef.current.length; i++) {
+                const p = particlesRef.current[i]
+                if (needsColorUpdate) {
                     instancedMeshRef.current.setColorAt(i, p.currentColor)
+                }
                 dummy.position.copy(p.currentPosition)
                 dummy.scale.set(particleSize, particleSize, particleSize)
                 dummy.updateMatrix()
@@ -605,24 +906,25 @@ const ImageParticleEffect: React.FC<ImageParticleEffectProps> = (props) => {
             cameraRef.current.aspect = width / height
             cameraRef.current.updateProjectionMatrix()
         }
-        window.addEventListener("resize", handleResize)
+
+        const resizeObserver = new ResizeObserver(handleResize)
+        resizeObserver.observe(currentMount)
 
         return () => {
-            window.removeEventListener("resize", handleResize)
-            if (enableMouseMove)
-                window.removeEventListener("mousemove", handleMouseMove)
-            if (enableMouseClick) {
-                window.removeEventListener("mousedown", handleMouseDown)
-                window.removeEventListener("mouseup", handleMouseUp)
+            resizeObserver.disconnect()
+            if (enablePushForce) {
+                window.removeEventListener("mousemove", handlePointerMove)
+                window.removeEventListener("touchmove", handlePointerMove)
             }
+            window.removeEventListener("mousedown", handlePointerDown)
+            window.removeEventListener("touchstart", handlePointerDown)
+            window.removeEventListener("mouseup", handlePointerUp)
+            window.removeEventListener("touchend", handlePointerUp)
             if (animationFrameIdRef.current) {
                 cancelAnimationFrame(animationFrameIdRef.current)
             }
-            if (rendererRef.current) {
-                // Do not remove the renderer DOM element on cleanup to persist the canvas
-            }
         }
-    }, [enableMouseMove, enableMouseClick]) // Only run for setup and listeners
+    }, [enablePushForce])
 
     useEffect(() => {
         const loader = new THREE.ImageLoader()
@@ -633,23 +935,36 @@ const ImageParticleEffect: React.FC<ImageParticleEffectProps> = (props) => {
 
                 if (!instancedMeshRef.current) {
                     // --- INITIAL LOAD ---
-                    particlesRef.current = sourceData.map((data) => ({
-                        currentPosition: data.position.clone(),
-                        sourcePosition: data.position.clone(),
-                        targetPosition: data.position.clone(),
-                        velocity: new THREE.Vector3(0, 0, 0),
-                        currentColor: data.color.clone(),
-                        sourceColor: data.color.clone(),
-                        targetColor: data.color.clone(),
-                        attractorPosition: data.position.clone(),
-                        burstPosition: new THREE.Vector3(),
-                        sphereTargetPosition: new THREE.Vector3(),
-                        mouseBurstPosition: new THREE.Vector3(),
-                    }))
+                    particlesRef.current = sourceData.map((data, i) => {
+                        const vibrantColor = applyVibrancy(
+                            data.color.clone(),
+                            appearance.vibrancy
+                        )
+                        return {
+                            id: i,
+                            currentPosition: data.position.clone(),
+                            sourcePosition: data.position.clone(),
+                            targetPosition: data.position.clone(),
+                            velocity: new THREE.Vector3(0, 0, 0),
+                            currentColor: vibrantColor.clone(),
+                            sourceColor: vibrantColor.clone(),
+                            targetColor: vibrantColor.clone(),
+                            sourceBaseColor: data.color.clone(),
+                            targetBaseColor: data.color.clone(),
+                            attractorPosition: data.position.clone(),
+                            burstPosition: new THREE.Vector3(),
+                            sphereTargetPosition: new THREE.Vector3(),
+                            mouseBurstPosition: new THREE.Vector3(),
+                        }
+                    })
 
                     const particleCount = particlesRef.current.length
-                    const particleGeometry = new THREE.CircleGeometry(1, 6)
-                    const particleMaterial = new THREE.MeshBasicMaterial()
+                    const particleGeometry = new THREE.SphereGeometry(
+                        0.75,
+                        8,
+                        6
+                    )
+                    const particleMaterial = new THREE.MeshStandardMaterial({})
                     instancedMeshRef.current = new THREE.InstancedMesh(
                         particleGeometry,
                         particleMaterial,
@@ -680,8 +995,14 @@ const ImageParticleEffect: React.FC<ImageParticleEffectProps> = (props) => {
                         existingParticles[i].sourcePosition.copy(
                             sourceData[i].position
                         )
-                        existingParticles[i].sourceColor.copy(
+                        existingParticles[i].sourceBaseColor.copy(
                             sourceData[i].color
+                        )
+                        applyVibrancy(
+                            existingParticles[i].sourceColor.copy(
+                                sourceData[i].color
+                            ),
+                            appearance.vibrancy
                         )
                     }
                     if (existingParticles.length > numParticles) {
@@ -694,8 +1015,14 @@ const ImageParticleEffect: React.FC<ImageParticleEffectProps> = (props) => {
                             existingParticles[i].sourcePosition.copy(
                                 sourceData[sourceIndex].position
                             )
-                            existingParticles[i].sourceColor.copy(
+                            existingParticles[i].sourceBaseColor.copy(
                                 sourceData[sourceIndex].color
+                            )
+                            applyVibrancy(
+                                existingParticles[i].sourceColor.copy(
+                                    sourceData[sourceIndex].color
+                                ),
+                                appearance.vibrancy
                             )
                         }
                     }
@@ -706,7 +1033,12 @@ const ImageParticleEffect: React.FC<ImageParticleEffectProps> = (props) => {
                     ) {
                         existingParticles.forEach((p) => {
                             p.attractorPosition.copy(p.sourcePosition)
+                            p.currentColor.copy(p.sourceColor)
                         })
+                        if (instancedMeshRef.current) {
+                            instancedMeshRef.current.instanceColor!.needsUpdate =
+                                true
+                        }
                     }
                 }
             })
@@ -716,6 +1048,7 @@ const ImageParticleEffect: React.FC<ImageParticleEffectProps> = (props) => {
         force.particleDensity,
         getImageParticleData,
         morphState,
+        appearance.vibrancy,
     ])
 
     useEffect(() => {
@@ -745,8 +1078,14 @@ const ImageParticleEffect: React.FC<ImageParticleEffectProps> = (props) => {
                             existingParticles[i].targetPosition.copy(
                                 targetData[i].position
                             )
-                            existingParticles[i].targetColor.copy(
+                            existingParticles[i].targetBaseColor.copy(
                                 targetData[i].color
+                            )
+                            applyVibrancy(
+                                existingParticles[i].targetColor.copy(
+                                    targetData[i].color
+                                ),
+                                appearance.vibrancy
                             )
                         }
                         if (existingParticles.length > numParticles) {
@@ -759,8 +1098,14 @@ const ImageParticleEffect: React.FC<ImageParticleEffectProps> = (props) => {
                                 existingParticles[i].targetPosition.copy(
                                     targetData[targetIndex].position
                                 )
-                                existingParticles[i].targetColor.copy(
+                                existingParticles[i].targetBaseColor.copy(
                                     targetData[targetIndex].color
+                                )
+                                applyVibrancy(
+                                    existingParticles[i].targetColor.copy(
+                                        targetData[targetIndex].color
+                                    ),
+                                    appearance.vibrancy
                                 )
                             }
                         }
@@ -771,7 +1116,12 @@ const ImageParticleEffect: React.FC<ImageParticleEffectProps> = (props) => {
                         ) {
                             existingParticles.forEach((p) => {
                                 p.attractorPosition.copy(p.targetPosition)
+                                p.currentColor.copy(p.targetColor)
                             })
+                            if (instancedMeshRef.current) {
+                                instancedMeshRef.current.instanceColor!.needsUpdate =
+                                    true
+                            }
                         }
                     }
                 )
@@ -782,6 +1132,7 @@ const ImageParticleEffect: React.FC<ImageParticleEffectProps> = (props) => {
         getImageParticleData,
         force.particleDensity,
         morphState,
+        appearance.vibrancy,
     ])
 
     useEffect(() => {
@@ -800,7 +1151,15 @@ const ImageParticleEffect: React.FC<ImageParticleEffectProps> = (props) => {
                 sourceParticles[i].targetPosition.copy(
                     targetParticles[i].position
                 )
-                sourceParticles[i].targetColor.copy(targetParticles[i].color)
+                sourceParticles[i].targetBaseColor.copy(
+                    targetParticles[i].color
+                )
+                applyVibrancy(
+                    sourceParticles[i].targetColor.copy(
+                        targetParticles[i].color
+                    ),
+                    appearance.vibrancy
+                )
             }
             if (sourceParticles.length > numParticles) {
                 for (let i = numParticles; i < sourceParticles.length; i++) {
@@ -808,8 +1167,14 @@ const ImageParticleEffect: React.FC<ImageParticleEffectProps> = (props) => {
                     sourceParticles[i].targetPosition.copy(
                         targetParticles[targetIndex].position
                     )
-                    sourceParticles[i].targetColor.copy(
+                    sourceParticles[i].targetBaseColor.copy(
                         targetParticles[targetIndex].color
+                    )
+                    applyVibrancy(
+                        sourceParticles[i].targetColor.copy(
+                            targetParticles[targetIndex].color
+                        ),
+                        appearance.vibrancy
                     )
                 }
             }
@@ -835,7 +1200,7 @@ const ImageParticleEffect: React.FC<ImageParticleEffectProps> = (props) => {
             morphStateRef.current.startTime = performance.now()
             morphStateRef.current.direction = morphDirection
         }
-    }, [morphDirection])
+    }, [morphDirection, appearance.vibrancy])
 
     return (
         <div
@@ -865,21 +1230,47 @@ const defaultProps = {
     objectPosition: { x: 0, y: 0, z: 0 },
     objectRotation: { x: 0, y: 0, z: 0 },
     sceneRotation: { x: 0, y: 0, z: 0 },
-    enableMouseMove: true,
-    enableMouseClick: true,
+    enablePushForce: true,
+    enableCollisions: true,
     force: {
         returnStrength: 0.02,
         damping: 0.92,
         pushRadius: 60,
         pushStrength: 0.8,
         particleSize: 1.25,
-        particleDensity: 2,
+        particleDensity: 4,
+    },
+    lighting: {
+        ambientLightColor: "#ffffff",
+        ambientLightIntensity: 0.5,
+        pointLightColor: "#ffffff",
+        pointLightIntensity: 5,
+        pointLightPosition: { x: 100, y: 100, z: 100 },
+    },
+    appearance: {
+        vibrancy: 1.2,
+        exposure: 1.0,
     },
 }
 
+/**
+ * @framerSupportedLayoutWidth any-prefer-fixed
+ * @framerSupportedLayoutHeight any-prefer-fixed
+ * @framerIntrinsicWidth 600
+ * @framerIntrinsicHeight 800
+ * @framerDisableUnlink
+ */
+
 export function FramerImageParticleEffect(props: typeof defaultProps) {
-    const { width, height, morphState, sourceImage, targetImage, ...rest } =
-        props
+    const {
+        width,
+        height,
+        morphState,
+        sourceImage,
+        targetImage,
+        appearance,
+        ...rest
+    } = props
 
     const [morphDirection, setMorphDirection] = useState<
         "toTarget" | "toSource" | null
@@ -903,6 +1294,7 @@ export function FramerImageParticleEffect(props: typeof defaultProps) {
                 sourceImageUrl={sourceImage}
                 targetImageUrl={targetImage}
                 morphState={morphState}
+                appearance={appearance}
                 {...rest}
                 morphDirection={morphDirection}
                 onMorphComplete={handleMorphComplete}
@@ -928,6 +1320,42 @@ addPropertyControls(FramerImageParticleEffect, {
         options: ["source", "target"],
         optionTitles: ["Source", "Target"],
         defaultValue: "source",
+    },
+    appearance: {
+        type: ControlType.Object,
+        title: "Appearance",
+        controls: {
+            vibrancy: {
+                type: ControlType.Number,
+                title: "Vibrancy",
+                defaultValue: 1.2,
+                min: 0,
+                max: 3,
+                step: 0.1,
+            },
+            exposure: {
+                type: ControlType.Number,
+                title: "Exposure",
+                defaultValue: 1.0,
+                min: 0,
+                max: 3,
+                step: 0.1,
+            },
+        },
+    },
+    enablePushForce: {
+        type: ControlType.Boolean,
+        title: "Push Force",
+        defaultValue: true,
+        enabledTitle: "On",
+        disabledTitle: "Off",
+    },
+    enableCollisions: {
+        type: ControlType.Boolean,
+        title: "Collisions",
+        defaultValue: true,
+        enabledTitle: "On",
+        disabledTitle: "Off",
     },
     force: {
         type: ControlType.Object,
@@ -976,10 +1404,69 @@ addPropertyControls(FramerImageParticleEffect, {
             particleDensity: {
                 type: ControlType.Number,
                 title: "Density",
-                defaultValue: 2,
+                defaultValue: 4,
                 min: 1,
                 max: 10,
                 step: 1,
+            },
+        },
+    },
+    lighting: {
+        type: ControlType.Object,
+        title: "Lighting",
+        controls: {
+            ambientLightColor: {
+                type: ControlType.Color,
+                title: "Ambient Color",
+                defaultValue: "#ffffff",
+            },
+            ambientLightIntensity: {
+                type: ControlType.Number,
+                title: "Ambient Power",
+                defaultValue: 0.5,
+                min: 0,
+                max: 2,
+                step: 0.1,
+            },
+            pointLightColor: {
+                type: ControlType.Color,
+                title: "Point Color",
+                defaultValue: "#ffffff",
+            },
+            pointLightIntensity: {
+                type: ControlType.Number,
+                title: "Point Power",
+                defaultValue: 5,
+                min: 0,
+                max: 50,
+                step: 0.1,
+            },
+            pointLightPosition: {
+                type: ControlType.Object,
+                title: "Point Position",
+                controls: {
+                    x: {
+                        type: ControlType.Number,
+                        defaultValue: 100,
+                        min: -500,
+                        max: 500,
+                        step: 10,
+                    },
+                    y: {
+                        type: ControlType.Number,
+                        defaultValue: 100,
+                        min: -500,
+                        max: 500,
+                        step: 10,
+                    },
+                    z: {
+                        type: ControlType.Number,
+                        defaultValue: 100,
+                        min: -500,
+                        max: 500,
+                        step: 10,
+                    },
+                },
             },
         },
     },
@@ -1081,19 +1568,5 @@ addPropertyControls(FramerImageParticleEffect, {
                 unit: "°",
             },
         },
-    },
-    enableMouseMove: {
-        type: ControlType.Boolean,
-        title: "Mouse Move",
-        defaultValue: true,
-        enabledTitle: "On",
-        disabledTitle: "Off",
-    },
-    enableMouseClick: {
-        type: ControlType.Boolean,
-        title: "Mouse Click",
-        defaultValue: true,
-        enabledTitle: "On",
-        disabledTitle: "Off",
     },
 })
